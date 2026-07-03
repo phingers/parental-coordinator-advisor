@@ -1,0 +1,411 @@
+"""
+Parental Coordinator Meeting Advisor
+Real-time audio capture, transcription, and strategic response generation.
+"""
+
+import os
+import sys
+import time
+import json
+import threading
+import queue
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+
+# Project paths
+ROOT = Path(__file__).parent.parent
+DOCS_DIR = ROOT / "docs" / "philosophy"
+CONFIG_DIR = ROOT / "config"
+SESSION_DIR = ROOT / "sessions"
+
+@dataclass
+class Config:
+    """Runtime configuration."""
+    # Audio
+    sample_rate: int = 16000
+    channels: int = 1
+    audio_device: Optional[str] = "BlackHole 2ch"  # Set to None to list devices
+    
+    # Transcription
+    whisper_model: str = "tiny.en"  # tiny.en, base.en, small.en
+    vad_threshold: float = 0.5
+    silence_timeout: float = 1.5  # seconds of silence before segment boundary
+    
+    # LLM
+    llm_provider: str = "hermes"  # hermes, openai, anthropic
+    llm_model: str = "claude-sonnet-4"  # or whichever model you use
+    
+    # Response
+    max_context_tokens: int = 8000
+    response_count: int = 3  # how many response options to generate
+    
+    # TUI
+    scrollback_lines: int = 50
+
+# ─── Audio Capture ─────────────────────────────────────────────
+
+class AudioCapture:
+    """Captures system audio from BlackHole virtual device."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.stream = None
+        self.running = False
+        self.audio_queue = queue.Queue()
+        
+    def list_devices(self):
+        """Print available audio devices."""
+        import sounddevice as sd
+        print("\nAvailable audio devices:")
+        for i, dev in enumerate(sd.query_devices()):
+            print(f"  {i}: {dev['name']} (in={dev['max_input_channels']}, out={dev['max_output_channels']})")
+    
+    def find_blackhole(self) -> Optional[int]:
+        """Find BlackHole device index."""
+        import sounddevice as sd
+        for i, dev in enumerate(sd.query_devices()):
+            if "blackhole" in dev['name'].lower():
+                return i
+        return None
+    
+    def audio_callback(self, indata, frames, time_info, status):
+        """Called for each audio block."""
+        if status:
+            print(f"Audio status: {status}", file=sys.stderr)
+        self.audio_queue.put(indata.copy())
+    
+    def start(self):
+        import sounddevice as sd
+        
+        device_idx = self.find_blackhole()
+        if device_idx is None:
+            print("ERROR: BlackHole not found. Install with: brew install blackhole-2ch")
+            print("Then create a Multi-Output Device in Audio MIDI Setup.")
+            self.list_devices()
+            sys.exit(1)
+        
+        print(f"Using BlackHole device: {device_idx}")
+        self.running = True
+        self.stream = sd.InputStream(
+            device=device_idx,
+            channels=self.config.channels,
+            samplerate=self.config.sample_rate,
+            callback=self.audio_callback,
+            blocksize=1024
+        )
+        self.stream.start()
+        print("Audio capture started. Listening...")
+    
+    def stop(self):
+        self.running = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+
+# ─── Voice Activity Detection ───────────────────────────────────
+
+class VAD:
+    """Silero VAD wrapper — filters silence and non-speech."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.model = None
+        self.speech_buffer = []
+        self.silence_duration = 0.0
+        self.is_speaking = False
+        
+    def load(self):
+        """Load Silero VAD model."""
+        try:
+            import torch
+            self.model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False
+            )
+            self.get_speech_timestamps = utils[0]
+            print("VAD model loaded.")
+        except Exception as e:
+            print(f"VAD load failed: {e}. Using energy-based VAD fallback.")
+            self.model = None
+    
+    def is_voice(self, audio_chunk) -> bool:
+        """Check if audio chunk contains speech."""
+        if self.model is not None:
+            import torch
+            tensor = torch.from_numpy(audio_chunk.flatten()).float()
+            if tensor.abs().max() > 0.001:
+                prob = self.model(tensor, self.config.sample_rate).item()
+                return prob > self.config.vad_threshold
+        
+        # Fallback: energy-based detection
+        import numpy as np
+        energy = np.sqrt(np.mean(audio_chunk ** 2))
+        return energy > 0.001
+
+# ─── Transcription ──────────────────────────────────────────────
+
+class Transcriber:
+    """Real-time transcription using faster-whisper."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.model = None
+        self.transcript_queue = queue.Queue()
+        
+    def load(self):
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(
+            self.config.whisper_model,
+            device="cpu",
+            compute_type="int8"
+        )
+        print(f"Whisper model loaded: {self.config.whisper_model}")
+    
+    def transcribe(self, audio_segment):
+        """Transcribe an audio segment. Returns text or None."""
+        if self.model is None:
+            return None
+        segments, _ = self.model.transcribe(
+            audio_segment.flatten().astype('float32'),
+            language="en",
+            beam_size=5,
+            vad_filter=True
+        )
+        text = " ".join(seg.text for seg in segments)
+        return text.strip() if text.strip() else None
+
+# ─── Philosophy RAG ─────────────────────────────────────────────
+
+class PhilosophyContext:
+    """Loads and retrieves parenting philosophy documents."""
+    
+    def __init__(self, docs_dir: Path):
+        self.docs_dir = docs_dir
+        self.documents = {}
+        self.load()
+    
+    def load(self):
+        """Load all markdown files from docs/philosophy/."""
+        for md_file in self.docs_dir.glob("*.md"):
+            with open(md_file) as f:
+                self.documents[md_file.stem] = f.read()
+        print(f"Loaded {len(self.documents)} philosophy documents: {list(self.documents.keys())}")
+    
+    def get_context(self, max_chars: int = 4000) -> str:
+        """Get compressed philosophy context for the LLM prompt."""
+        parts = []
+        for name, content in self.documents.items():
+            # Take the most critical parts — headers and bullet points
+            lines = content.split('\n')
+            summary = []
+            for line in lines:
+                if line.startswith('#') or line.startswith('-') or line.startswith('|'):
+                    summary.append(line)
+            parts.append(f"## {name}\n" + '\n'.join(summary[:30]))
+        
+        full = '\n\n'.join(parts)
+        if len(full) > max_chars:
+            full = full[:max_chars] + "\n...(truncated)"
+        return full
+
+# ─── Response Generator ─────────────────────────────────────────
+
+class ResponseGenerator:
+    """Generates strategic responses using the LLM."""
+    
+    SYSTEM_PROMPT = """You are a strategic co-pilot for a parent in a high-conflict co-parenting meeting with a parental coordinator named Penni. The other party is named Al.
+
+Your job:
+1. Analyze what's being said for adversarial patterns (gaslighting, deflection, false equivalence, emotional bait, moving goalposts)
+2. Generate 2-3 response options for the user to say
+3. Every response must be grounded in the user's parenting philosophy (provided below)
+4. Prioritize factual, documented statements over emotional reactions
+5. Flag contradictions against past statements
+
+Response format for each option:
+[PATTERN ALERT if applicable — e.g., "⚠️ Gaslighting — contradicts June 3rd agreement"]
+🛡️ DEFENSIVE: [response option]
+⚖️ NEUTRAL: [response option]  
+🎯 STRATEGIC: [response option]
+
+Keep responses concise (1-3 sentences each). The user needs to read and deliver them in real-time.
+
+Parenting philosophy:
+{philosophy}"""
+
+    def __init__(self, config: Config, philosophy: PhilosophyContext):
+        self.config = config
+        self.philosophy = philosophy
+    
+    def generate(self, transcript_segment: str, conversation_history: list[str]) -> str:
+        """Generate response options for the latest transcript segment."""
+        philosophy_text = self.philosophy.get_context()
+        
+        system = self.SYSTEM_PROMPT.format(philosophy=philosophy_text)
+        
+        history_text = "\n".join(conversation_history[-20:])  # Last 20 exchanges
+        user_prompt = f"""Conversation so far:
+{history_text}
+
+Latest statement (from Al or Penni):
+"{transcript_segment}"
+
+Generate 2-3 response options for the user (Bryan). Remember: factual, documented, child-focused."""
+
+        # This will use Hermes's LLM — in the real implementation,
+        # we'll call the Hermes API or use the local model
+        return self._call_llm(system, user_prompt)
+    
+    def _call_llm(self, system: str, user: str) -> str:
+        """Call the LLM. In production, this calls Hermes."""
+        # TODO: Integrate with Hermes API or direct provider call
+        # For now, return a placeholder that shows the structure works
+        return f"""[Analyzing: {user[:80]}...]
+
+🛡️ DEFENSIVE: [Response grounded in documented facts — cite specific dates/agreements]
+⚖️ NEUTRAL: [Response that de-escalates while maintaining your position]
+🎯 STRATEGIC: [Response that advances your goals for this meeting]
+
+⚠️ Note: Full LLM integration pending. Fill in docs/philosophy/*.md for personalized responses."""
+
+# ─── Session Manager ────────────────────────────────────────────
+
+class SessionManager:
+    """Tracks conversation, saves transcripts, manages state."""
+    
+    def __init__(self, session_dir: Path):
+        self.session_dir = session_dir
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.conversation: list[dict] = []
+        self.start_time = time.time()
+        
+    def add(self, speaker: str, text: str, timestamp: Optional[float] = None):
+        ts = timestamp or time.time() - self.start_time
+        entry = {"timestamp": ts, "speaker": speaker, "text": text}
+        self.conversation.append(entry)
+        self._save()
+        return entry
+    
+    def _save(self):
+        session_file = self.session_dir / f"session_{int(self.start_time)}.jsonl"
+        with open(session_file, 'a') as f:
+            f.write(json.dumps(self.conversation[-1]) + '\n')
+    
+    def get_history(self, n: int = 20) -> list[str]:
+        return [f"[{e['speaker']}]: {e['text']}" for e in self.conversation[-n:]]
+    
+    def export_markdown(self) -> Path:
+        md_file = self.session_dir / f"transcript_{int(self.start_time)}.md"
+        with open(md_file, 'w') as f:
+            f.write(f"# Parental Coordinator Meeting\n")
+            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M')}\n\n")
+            for entry in self.conversation:
+                mins = int(entry['timestamp'] // 60)
+                secs = int(entry['timestamp'] % 60)
+                f.write(f"**[{mins:02d}:{secs:02d}] {entry['speaker']}:** {entry['text']}\n\n")
+        return md_file
+
+# ─── Main Application ──────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  Parental Coordinator Meeting Advisor")
+    print("  Real-time strategic co-pilot")
+    print("=" * 60)
+    
+    config = Config()
+    
+    # Load philosophy documents
+    philosophy = PhilosophyContext(DOCS_DIR)
+    
+    if not philosophy.documents:
+        print("\n⚠️  WARNING: No philosophy documents found!")
+        print(f"   Fill in the templates at: {DOCS_DIR}")
+        print("   The AI won't generate personalized responses without them.\n")
+    
+    # Initialize components
+    audio = AudioCapture(config)
+    vad = VAD(config)
+    transcriber = Transcriber(config)
+    response_gen = ResponseGenerator(config, philosophy)
+    session = SessionManager(SESSION_DIR)
+    
+    # Load models
+    print("\nLoading models...")
+    vad.load()
+    transcriber.load()
+    print("\n✅ Ready. The system will capture audio from your speakers.")
+    print("   Start your Teams call, then return here.\n")
+    print("   Press Ctrl+C to stop.\n")
+    
+    # Check BlackHole
+    if audio.find_blackhole() is None:
+        print("ERROR: BlackHole not found.")
+        print("Install: brew install blackhole-2ch")
+        print("Then: Audio MIDI Setup → Create Multi-Output Device → Add Speakers + BlackHole")
+        sys.exit(1)
+    
+    # Start capture
+    audio.start()
+    
+    # Processing loop
+    audio_buffer = []
+    last_transcript_time = time.time()
+    silence_start = None
+    
+    try:
+        while audio.running:
+            # Get audio chunk
+            try:
+                chunk = audio.audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            
+            # VAD check
+            if vad.is_voice(chunk):
+                audio_buffer.append(chunk)
+                silence_start = None
+            else:
+                if audio_buffer and silence_start is None:
+                    silence_start = time.time()
+                
+                # If silence for long enough, process the segment
+                if silence_start and (time.time() - silence_start) > config.silence_timeout:
+                    if audio_buffer:
+                        # Combine buffer and transcribe
+                        import numpy as np
+                        segment = np.concatenate(audio_buffer)
+                        text = transcriber.transcribe(segment)
+                        
+                        if text:
+                            timestamp = time.time()
+                            print(f"\n📝 [{time.strftime('%H:%M:%S')}] {text}")
+                            
+                            # Add to session
+                            session.add("Unknown", text, timestamp)
+                            
+                            # Generate response
+                            history = session.get_history()
+                            response = response_gen.generate(text, history)
+                            print(f"\n{response}")
+                            print("-" * 40)
+                        
+                        audio_buffer = []
+                        silence_start = None
+    
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+    
+    finally:
+        audio.stop()
+        
+        # Export transcript
+        if session.conversation:
+            md_path = session.export_markdown()
+            print(f"\n📄 Transcript saved: {md_path}")
+            print(f"   Total exchanges: {len(session.conversation)}")
+
+if __name__ == "__main__":
+    main()
