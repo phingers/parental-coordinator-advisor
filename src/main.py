@@ -75,17 +75,44 @@ class AudioCapture:
             print(f"Audio status: {status}", file=sys.stderr)
         self.audio_queue.put(indata.copy())
     
-    def start(self):
+    def find_mic(self) -> Optional[int]:
+        """Find the built-in microphone device index."""
+        import sounddevice as sd
+        for i, dev in enumerate(sd.query_devices()):
+            name = dev['name'].lower()
+            if dev['max_input_channels'] > 0 and (
+                'built-in' in name or 
+                'macbook' in name or
+                'microphone' in name
+            ):
+                return i
+        # Fallback: first device with input channels
+        for i, dev in enumerate(sd.query_devices()):
+            if dev['max_input_channels'] > 0:
+                return i
+        return None
+    
+    def start(self, mode: str = "blackhole"):
+        """Start audio capture. Mode: 'blackhole' (system audio) or 'mic' (built-in mic)."""
         import sounddevice as sd
         
-        device_idx = self.find_blackhole()
-        if device_idx is None:
-            print("ERROR: BlackHole not found. Install with: brew install blackhole-2ch")
-            print("Then create a Multi-Output Device in Audio MIDI Setup.")
-            self.list_devices()
-            sys.exit(1)
-        
-        print(f"Using BlackHole device: {device_idx}")
+        if mode == "mic":
+            device_idx = self.find_mic()
+            if device_idx is None:
+                print("ERROR: No microphone found.")
+                self.list_devices()
+                sys.exit(1)
+            print(f"🎤 Using microphone: [{device_idx}] {sd.query_devices()[device_idx]['name']}")
+            print(f"   (Place this Mac near the Mac Studio speakers)")
+        else:
+            device_idx = self.find_blackhole()
+            if device_idx is None:
+                print("ERROR: BlackHole not found. Install with: brew install blackhole-2ch")
+                print("Or run with --mic to use the built-in microphone instead.")
+                print("   python src/main.py --mic")
+                self.list_devices()
+                sys.exit(1)
+            print(f"🎧 Using BlackHole system audio: {device_idx}")
         self.running = True
         self.stream = sd.InputStream(
             device=device_idx,
@@ -359,6 +386,18 @@ class SessionManager:
 # ─── Main Application ──────────────────────────────────────────
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Parental Coordinator Meeting Advisor")
+    parser.add_argument("--mic", action="store_true", 
+                       help="Use built-in microphone (for two-Mac setup: Teams on one Mac, advisor on another)")
+    parser.add_argument("--blackhole", action="store_true",
+                       help="Use BlackHole system audio capture (Teams + advisor on same Mac)")
+    args = parser.parse_args()
+    
+    # Default to BlackHole if neither specified, but fall back to mic if BlackHole unavailable
+    mode = "mic" if args.mic else "blackhole"
+    
     print("=" * 60)
     print("  Parental Coordinator Meeting Advisor")
     print("  Real-time strategic co-pilot")
@@ -385,19 +424,18 @@ def main():
     print("\nLoading models...")
     vad.load()
     transcriber.load()
-    print("\n✅ Ready. The system will capture audio from your speakers.")
-    print("   Start your Teams call, then return here.\n")
-    print("   Press Ctrl+C to stop.\n")
-    
-    # Check BlackHole
-    if audio.find_blackhole() is None:
-        print("ERROR: BlackHole not found.")
-        print("Install: brew install blackhole-2ch")
-        print("Then: Audio MIDI Setup → Create Multi-Output Device → Add Speakers + BlackHole")
-        sys.exit(1)
     
     # Start capture
-    audio.start()
+    if mode == "mic" or audio.find_blackhole() is None:
+        if mode != "mic" and audio.find_blackhole() is None:
+            print("\n⚠️  BlackHole not found. Falling back to microphone mode.")
+            print("   (Place this Mac near the Mac Studio speakers)")
+        audio.start(mode="mic")
+    else:
+        audio.start(mode="blackhole")
+    
+    print("\n✅ Ready. Listening...")
+    print("   Press Ctrl+C to stop.\n")
     
     # Processing loop
     audio_buffer = []
