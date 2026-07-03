@@ -16,6 +16,7 @@ from typing import Optional
 # Project paths
 ROOT = Path(__file__).parent.parent
 DOCS_DIR = ROOT / "docs" / "philosophy"
+REFERENCE_DIR = ROOT / "docs" / "reference"
 CONFIG_DIR = ROOT / "config"
 SESSION_DIR = ROOT / "sessions"
 
@@ -206,25 +207,39 @@ class Transcriber:
 # ─── Philosophy RAG ─────────────────────────────────────────────
 
 class PhilosophyContext:
-    """Loads and retrieves parenting philosophy documents."""
+    """Loads and retrieves parenting philosophy and reference documents."""
     
-    def __init__(self, docs_dir: Path):
+    def __init__(self, docs_dir: Path, reference_dir: Optional[Path] = None):
         self.docs_dir = docs_dir
-        self.documents = {}
+        self.reference_dir = reference_dir
+        self.documents = {}       # Philosophy: principles, frameworks
+        self.reference = {}        # History: meeting notes, emails, legal docs
         self.load()
     
     def load(self):
-        """Load all markdown files from docs/philosophy/."""
+        """Load all markdown files from docs/philosophy/ and docs/reference/."""
+        loaded = []
         for md_file in self.docs_dir.glob("*.md"):
             with open(md_file) as f:
                 self.documents[md_file.stem] = f.read()
-        print(f"Loaded {len(self.documents)} philosophy documents: {list(self.documents.keys())}")
+            loaded.append(md_file.stem)
+        print(f"Loaded {len(loaded)} philosophy documents: {loaded}")
+        
+        if self.reference_dir and self.reference_dir.exists():
+            ref_loaded = []
+            # Load from all subdirectories (meeting-notes, emails, legal)
+            for md_file in self.reference_dir.rglob("*.md"):
+                rel_path = str(md_file.relative_to(self.reference_dir)).replace('/', ' › ')
+                with open(md_file) as f:
+                    self.reference[rel_path] = f.read()
+                ref_loaded.append(rel_path)
+            if ref_loaded:
+                print(f"Loaded {len(ref_loaded)} reference documents: {ref_loaded}")
     
     def get_context(self, max_chars: int = 4000) -> str:
         """Get compressed philosophy context for the LLM prompt."""
         parts = []
         for name, content in self.documents.items():
-            # Take the most critical parts — headers and bullet points
             lines = content.split('\n')
             summary = []
             for line in lines:
@@ -236,6 +251,25 @@ class PhilosophyContext:
         if len(full) > max_chars:
             full = full[:max_chars] + "\n...(truncated)"
         return full
+    
+    def search_reference(self, query: str) -> str:
+        """Search reference docs for relevant facts. Returns matching excerpts."""
+        if not self.reference:
+            return ""
+        
+        results = []
+        query_lower = query.lower()
+        for name, content in self.reference.items():
+            if query_lower in content.lower():
+                # Extract the paragraph containing the match
+                for para in content.split('\n\n'):
+                    if query_lower in para.lower():
+                        results.append(f"[{name}]: {para.strip()[:300]}")
+                        break
+        
+        if results:
+            return "RELEVANT HISTORICAL RECORDS:\n" + '\n'.join(results[:3])
+        return ""
 
 # ─── Response Generator ─────────────────────────────────────────
 
@@ -319,16 +353,23 @@ PARENTING PHILOSOPHY REFERENCE:
         """Generate response options for the latest transcript segment."""
         philosophy_text = self.philosophy.get_context()
         
+        # Search reference docs for relevant historical facts
+        reference_text = self.philosophy.search_reference(transcript_segment)
+        
         system = self.SYSTEM_PROMPT.format(philosophy=philosophy_text)
         
-        history_text = "\n".join(conversation_history[-20:])  # Last 20 exchanges
+        history_text = "\n".join(conversation_history[-20:])
+        
+        # Include reference docs if found
+        ref_block = f"\n\nHISTORICAL RECORDS (use these to fact-check):\n{reference_text}" if reference_text else ""
+        
         user_prompt = f"""Conversation so far:
 {history_text}
 
 Latest statement (from Al or Penni):
-"{transcript_segment}"
+"{transcript_segment}"{ref_block}
 
-Generate 2-3 response options for the user (Bryan). Remember: factual, documented, child-focused."""
+Generate 2-3 response options for Bryan. If historical records are provided, cite them to counter contradictions. Remember: factual, balanced, child-focused."""
 
         # This will use Hermes's LLM — in the real implementation,
         # we'll call the Hermes API or use the local model
@@ -406,7 +447,7 @@ def main():
     config = Config()
     
     # Load philosophy documents
-    philosophy = PhilosophyContext(DOCS_DIR)
+    philosophy = PhilosophyContext(DOCS_DIR, REFERENCE_DIR)
     
     if not philosophy.documents:
         print("\n⚠️  WARNING: No philosophy documents found!")
